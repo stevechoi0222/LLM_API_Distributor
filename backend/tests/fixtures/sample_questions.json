@@ -1,0 +1,66 @@
+[
+  {
+    "campaign": "Sample Campaign",
+    "topic": {
+      "title": "Battery Life",
+      "description": "Questions about battery performance"
+    },
+    "persona": {
+      "name": "Tech Enthusiast",
+      "role": "Early Adopter",
+      "locale": "en-US",
+      "tone": "enthusiastic"
+    },
+    "question": {
+      "id": "SAMPLE_Q001",
+      "text": "How long does the battery last on a single charge?",
+      "metadata": {
+        "category": "battery",
+        "priority": "high"
+      }
+    }
+  },
+  {
+    "campaign": "Sample Campaign",
+    "topic": {
+      "title": "Performance",
+      "description": "Questions about device performance"
+    },
+    "persona": {
+      "name": "Professional User",
+      "role": "Business User",
+      "locale": "en-US",
+      "tone": "professional"
+    },
+    "question": {
+      "id": "SAMPLE_Q002",
+      "text": "Can it handle multiple applications running simultaneously?",
+      "metadata": {
+        "category": "performance",
+        "priority": "high"
+      }
+    }
+  },
+  {
+    "campaign": "Sample Campaign",
+    "topic": {
+      "title": "Camera Quality",
+      "description": "Questions about camera features"
+    },
+    "persona": {
+      "name": "Photography Enthusiast",
+      "role": "Content Creator",
+      "locale": "en-US",
+      "tone": "creative"
+    },
+    "question": {
+      "id": "SAMPLE_Q003",
+      "text": "How does the low-light photography compare to previous models?",
+      "metadata": {
+        "category": "camera",
+        "priority": "medium"
+      }
+    }
+  }
+]
+

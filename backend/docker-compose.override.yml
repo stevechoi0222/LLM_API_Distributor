@@ -1,0 +1,14 @@
+# Local development overrides
+# This file is automatically merged with docker-compose.yml
+
+version: '3.8'
+
+services:
+  api:
+    environment:
+      # Auto-apply migrations in local dev
+      DB_APPLY_MIGRATIONS: "true"
+      # Use local postgres
+      DATABASE_URL: postgresql+psycopg://geo:geo@postgres:5432/geo
+
+

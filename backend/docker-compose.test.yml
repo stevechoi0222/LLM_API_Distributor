@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  postgres-test:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: geo_test
+      POSTGRES_PASSWORD: geo_test
+      POSTGRES_DB: geo_test
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U geo_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  redis-test:
+    image: redis:7-alpine
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  test-runner:
+    build: .
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+      redis-test:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://geo_test:geo_test@postgres-test:5432/geo_test
+      REDIS_URL: redis://redis-test:6379/0
+      DB_SCHEMA: geo_app
+      DB_APPLY_MIGRATIONS: "true"
+      DB_COMPAT_MODE: "false"
+      USE_JSONB: "true"
+      API_KEYS: test-key-123
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ENABLE_OPENAI: "true"
+      ENABLE_GEMINI: "false"
+      ENABLE_PERPLEXITY: "false"
+      LOG_LEVEL: WARNING
+    volumes:
+      - ./tests:/app/tests
+      - ./htmlcov:/app/htmlcov
+    command: pytest tests/ -v -m "not slow" --cov=app --cov-report=html --cov-report=term-missing
+
