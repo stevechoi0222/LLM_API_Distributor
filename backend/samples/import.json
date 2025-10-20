@@ -1,0 +1,16 @@
+[
+  {
+    "campaign": "demo_launch",
+    "topic": {"title": "Battery life"},
+    "persona": {"name":"Alex","role":"Tech reviewer","locale":"en-US","tone":"neutral"},
+    "question": {"id":"Q_001","text":"Compare XPhone vs YPhone battery for a full day of use."},
+    "provider_overrides": {"temperature": 0}
+  },
+  {
+    "campaign": "demo_launch",
+    "topic": {"title": "Battery life"},
+    "persona": {"name":"Sam","role":"Commuter","locale":"en-US","tone":"curious"},
+    "question": {"id":"Q_002","text":"How many hours of screen-on time does XPhone get on average?"}
+  }
+]
+

@@ -225,8 +225,14 @@ class ExportResponse(BaseModel):
     status: str
     file_url: Optional[str]
     created_at: datetime
+    deliveries_created: Optional[int] = Field(
+        None, description="Number of deliveries created (TICKET 5)"
+    )
     delivery_stats: Optional[Dict[str, int]] = Field(
         None, description="Delivery counts by status (TICKET 5)"
+    )
+    sample_failures: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Sample of failed deliveries (up to 5)"
     )
 
     class Config:
@@ -243,9 +249,11 @@ class DeliveryResponse(BaseModel):
     export_id: str
     run_id: str
     mapper_name: str
+    mapper_version: str
     status: str
     attempts: int
     last_error: Optional[str]
+    response_body: Optional[str]
     created_at: datetime
     updated_at: datetime
 
