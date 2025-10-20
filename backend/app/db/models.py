@@ -249,6 +249,7 @@ class Delivery(Base):
     export_id = Column(String, ForeignKey(f"{settings.db_schema}.exports.id"), nullable=False)
     run_id = Column(String, nullable=False)  # Denormalized for queries
     mapper_name = Column(String(100), nullable=False)
+    mapper_version = Column(String(50), nullable=False, default="v1")
     payload_json = Column(get_json_type(), nullable=False)  # Mapped payload for partner
     status = Column(
         String(50),

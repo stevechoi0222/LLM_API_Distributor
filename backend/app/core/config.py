@@ -75,15 +75,37 @@ class Settings(BaseSettings):
     default_max_tokens: int = Field(default=1000, description="Default max tokens")
 
     # Cost Tracking (TICKET 3) - Prices in USD per 1K tokens
+    # OpenAI
     openai_gpt4o_mini_input_per_1k: float = Field(default=0.15)
     openai_gpt4o_mini_output_per_1k: float = Field(default=0.60)
     openai_gpt4o_input_per_1k: float = Field(default=2.50)
     openai_gpt4o_output_per_1k: float = Field(default=10.00)
+    
+    # Gemini (TKT-002)
+    gemini_pro_input_per_1k: float = Field(default=0.125)
+    gemini_pro_output_per_1k: float = Field(default=0.375)
+    gemini_flash_input_per_1k: float = Field(default=0.075)
+    gemini_flash_output_per_1k: float = Field(default=0.30)
+    
+    # Perplexity (TKT-002)
+    perplexity_sonar_small_input_per_1k: float = Field(default=0.20)
+    perplexity_sonar_small_output_per_1k: float = Field(default=0.20)
+    perplexity_sonar_large_input_per_1k: float = Field(default=1.00)
+    perplexity_sonar_large_output_per_1k: float = Field(default=1.00)
 
     # Delivery Queue (TICKET 5)
     max_delivery_attempts: int = Field(default=5, description="Max delivery retry attempts")
     delivery_retry_backoff_base: int = Field(
         default=2, description="Exponential backoff base for delivery retries"
+    )
+    delivery_timeout: float = Field(default=15.0, description="Partner delivery timeout in seconds")
+    partner_webhook_url: str = Field(
+        default="http://mock-partner.local/webhook", 
+        description="Partner webhook URL for deliveries"
+    )
+    partner_webhook_headers_json: str = Field(
+        default="{}",
+        description="Partner webhook headers as JSON string"
     )
 
     # Application
@@ -118,9 +140,10 @@ class Settings(BaseSettings):
         return limits.get(provider, {"qps": 1, "burst": 1})
 
     def get_model_pricing(self, provider: str, model: str) -> Dict[str, float]:
-        """Get pricing for a specific model (TICKET 3)."""
+        """Get pricing for a specific model (TICKET 3, TKT-002)."""
         # Format: provider:model → pricing
         pricing_map = {
+            # OpenAI
             "openai:gpt-4o-mini": {
                 "input_per_1k": self.openai_gpt4o_mini_input_per_1k,
                 "output_per_1k": self.openai_gpt4o_mini_output_per_1k,
@@ -129,14 +152,45 @@ class Settings(BaseSettings):
                 "input_per_1k": self.openai_gpt4o_input_per_1k,
                 "output_per_1k": self.openai_gpt4o_output_per_1k,
             },
-            # GPT-5 placeholder (use gpt-4o pricing until known)
             "openai:gpt-5-large": {
                 "input_per_1k": self.openai_gpt4o_input_per_1k,
                 "output_per_1k": self.openai_gpt4o_output_per_1k,
             },
+            
+            # Gemini (TKT-002)
+            "gemini:gemini-pro": {
+                "input_per_1k": self.gemini_pro_input_per_1k,
+                "output_per_1k": self.gemini_pro_output_per_1k,
+            },
+            "gemini:gemini-1.5-pro": {
+                "input_per_1k": self.gemini_pro_input_per_1k,
+                "output_per_1k": self.gemini_pro_output_per_1k,
+            },
+            "gemini:gemini-1.5-flash": {
+                "input_per_1k": self.gemini_flash_input_per_1k,
+                "output_per_1k": self.gemini_flash_output_per_1k,
+            },
+            
+            # Perplexity (TKT-002)
+            "perplexity:llama-3.1-sonar-small-128k-online": {
+                "input_per_1k": self.perplexity_sonar_small_input_per_1k,
+                "output_per_1k": self.perplexity_sonar_small_output_per_1k,
+            },
+            "perplexity:llama-3.1-sonar-large-128k-online": {
+                "input_per_1k": self.perplexity_sonar_large_input_per_1k,
+                "output_per_1k": self.perplexity_sonar_large_output_per_1k,
+            },
         }
         key = f"{provider}:{model}"
         return pricing_map.get(key, {"input_per_1k": 0.0, "output_per_1k": 0.0})
+
+    def get_partner_webhook_headers(self) -> Dict[str, str]:
+        """Parse partner webhook headers from JSON string."""
+        import json
+        try:
+            return json.loads(self.partner_webhook_headers_json)
+        except json.JSONDecodeError:
+            return {}
 
 
 # Global settings instance

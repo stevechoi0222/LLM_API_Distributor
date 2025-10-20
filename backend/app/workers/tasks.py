@@ -1,10 +1,12 @@
 """Celery tasks for run execution and deliveries."""
 import asyncio
 import json
+import random
 from datetime import datetime
 from typing import Any, Dict
 from sqlalchemy import select
 from tenacity import retry, stop_after_attempt, wait_exponential
+import httpx
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.rate_limit import get_rate_limiter
@@ -212,6 +214,11 @@ async def _export_job_async(export_id: str) -> Dict[str, Any]:
 def deliver_to_partner(self, delivery_id: str) -> Dict[str, Any]:
     """Deliver to partner API with retries (TICKET 5).
     
+    Handles HTTP responses:
+    - 2xx: Mark succeeded, store response
+    - 4xx: Mark failed (no retry), store response
+    - 5xx/network: Retry with exponential backoff + jitter
+    
     Args:
         delivery_id: Delivery ID
         
@@ -221,89 +228,243 @@ def deliver_to_partner(self, delivery_id: str) -> Dict[str, Any]:
     return asyncio.run(_deliver_to_partner_async(delivery_id, self))
 
 
-@retry(
-    stop=stop_after_attempt(settings.max_delivery_attempts),
-    wait=wait_exponential(
-        multiplier=1,
-        min=settings.delivery_retry_backoff_base,
-        max=60
-    )
-)
 async def _deliver_to_partner_async(delivery_id: str, task) -> Dict[str, Any]:
-    """Async implementation of partner delivery with retry."""
+    """Async implementation of partner delivery with retry logic."""
     async with AsyncSessionLocal() as session:
+        # Get delivery
+        stmt = select(Delivery).where(Delivery.id == delivery_id)
+        result = await session.execute(stmt)
+        delivery = result.scalar_one_or_none()
+
+        if not delivery:
+            logger.error("delivery_not_found", delivery_id=delivery_id)
+            return {"status": "failed", "error": "Delivery not found"}
+
+        # Update attempts
+        delivery.attempts += 1
+        await session.commit()
+
+        logger.info(
+            "delivery_started",
+            delivery_id=delivery_id,
+            attempt=delivery.attempts,
+            mapper=delivery.mapper_name
+        )
+
         try:
-            # Get delivery
-            stmt = select(Delivery).where(Delivery.id == delivery_id)
-            result = await session.execute(stmt)
-            delivery = result.scalar_one_or_none()
-
-            if not delivery:
-                logger.error("delivery_not_found", delivery_id=delivery_id)
-                return {"status": "failed", "error": "Delivery not found"}
-
-            # Update attempts
-            delivery.attempts += 1
-            await session.commit()
-
-            logger.info(
-                "delivery_started",
-                delivery_id=delivery_id,
-                attempt=delivery.attempts,
-                mapper=delivery.mapper_name
-            )
-
-            # Get mapper
-            mapper = get_mapper(delivery.mapper_name, version="v1")
-
             # Parse payload
             payload = json.loads(delivery.payload_json)
 
-            # Get webhook URL from export config
+            # Get webhook URL from config or use default
             stmt = select(Delivery.export).where(Delivery.id == delivery_id)
             export_result = await session.execute(stmt)
             export = export_result.scalar_one()
             
             config = json.loads(export.config_json) if export.config_json else {}
-            webhook_url = config.get("webhook_url")
+            webhook_url = config.get("webhook_url", settings.partner_webhook_url)
 
             if not webhook_url:
                 raise ValueError("webhook_url not configured")
 
-            # Deliver
-            response_data = await mapper.deliver(payload, webhook_url)
+            # Get custom headers
+            custom_headers = config.get("headers", {})
+            partner_headers = settings.get_partner_webhook_headers()
+            headers = {
+                "Content-Type": "application/json",
+                **partner_headers,
+                **custom_headers,  # Config overrides settings
+            }
 
-            # Update delivery
-            delivery.status = "succeeded"
-            delivery.response_body = response_data.get("body", "")
-            await session.commit()
+            # Apply rate limiting per partner (use mapper_name as bucket)
+            rate_limiter = get_rate_limiter()
+            bucket_name = f"partner_delivery_{delivery.mapper_name}"
+            acquired = await rate_limiter.acquire(bucket_name, tokens=1, timeout=30.0)
+            
+            if not acquired:
+                logger.warning(
+                    "delivery_rate_limited",
+                    delivery_id=delivery_id,
+                    mapper=delivery.mapper_name
+                )
+                # Retry with jitter
+                countdown = _calculate_backoff_with_jitter(delivery.attempts)
+                raise task.retry(exc=Exception("Rate limit timeout"), countdown=countdown)
 
-            logger.info(
-                "delivery_succeeded",
-                delivery_id=delivery_id,
-                status_code=response_data.get("status_code")
-            )
+            # POST to partner webhook
+            async with httpx.AsyncClient(timeout=settings.delivery_timeout) as client:
+                try:
+                    response = await client.post(
+                        webhook_url,
+                        json=payload,
+                        headers=headers
+                    )
+                    
+                    status_code = response.status_code
+                    response_body = response.text[:5000]  # Truncate large responses
+                    
+                    logger.info(
+                        "delivery_response_received",
+                        delivery_id=delivery_id,
+                        status_code=status_code,
+                        response_size=len(response.text)
+                    )
 
-            return {"status": "succeeded", "response": response_data}
+                    # Handle based on status code
+                    if 200 <= status_code < 300:
+                        # Success (2xx)
+                        delivery.status = "succeeded"
+                        delivery.response_body = response_body
+                        await session.commit()
+
+                        logger.info(
+                            "delivery_succeeded",
+                            delivery_id=delivery_id,
+                            status_code=status_code
+                        )
+
+                        return {
+                            "status": "succeeded",
+                            "status_code": status_code,
+                            "response": response_body
+                        }
+
+                    elif 400 <= status_code < 500:
+                        # Client error (4xx) - do NOT retry
+                        delivery.status = "failed"
+                        delivery.last_error = f"HTTP {status_code}: {response_body}"
+                        delivery.response_body = response_body
+                        await session.commit()
+
+                        logger.error(
+                            "delivery_failed_client_error",
+                            delivery_id=delivery_id,
+                            status_code=status_code,
+                            error=response_body[:500]
+                        )
+
+                        return {
+                            "status": "failed",
+                            "status_code": status_code,
+                            "error": f"HTTP {status_code}",
+                            "response": response_body
+                        }
+
+                    else:
+                        # Server error (5xx) or other - retry with backoff
+                        error_msg = f"HTTP {status_code}: {response_body[:500]}"
+                        delivery.last_error = error_msg
+                        await session.commit()
+
+                        logger.warning(
+                            "delivery_server_error_will_retry",
+                            delivery_id=delivery_id,
+                            status_code=status_code,
+                            attempt=delivery.attempts,
+                            max_attempts=settings.max_delivery_attempts
+                        )
+
+                        # Retry if attempts remaining
+                        if delivery.attempts < settings.max_delivery_attempts:
+                            countdown = _calculate_backoff_with_jitter(delivery.attempts)
+                            raise task.retry(
+                                exc=Exception(error_msg),
+                                countdown=countdown
+                            )
+                        else:
+                            # Max attempts exhausted
+                            delivery.status = "failed"
+                            await session.commit()
+                            return {
+                                "status": "failed",
+                                "error": f"Max attempts ({settings.max_delivery_attempts}) exhausted",
+                                "last_error": error_msg
+                            }
+
+                except httpx.TimeoutException as e:
+                    # Network timeout - retry
+                    error_msg = f"Timeout after {settings.delivery_timeout}s"
+                    delivery.last_error = error_msg
+                    await session.commit()
+
+                    logger.warning(
+                        "delivery_timeout_will_retry",
+                        delivery_id=delivery_id,
+                        attempt=delivery.attempts
+                    )
+
+                    if delivery.attempts < settings.max_delivery_attempts:
+                        countdown = _calculate_backoff_with_jitter(delivery.attempts)
+                        raise task.retry(exc=e, countdown=countdown)
+                    else:
+                        delivery.status = "failed"
+                        await session.commit()
+                        return {"status": "failed", "error": error_msg}
+
+                except httpx.NetworkError as e:
+                    # Network error - retry
+                    error_msg = f"Network error: {str(e)}"
+                    delivery.last_error = error_msg
+                    await session.commit()
+
+                    logger.warning(
+                        "delivery_network_error_will_retry",
+                        delivery_id=delivery_id,
+                        attempt=delivery.attempts,
+                        error=str(e)
+                    )
+
+                    if delivery.attempts < settings.max_delivery_attempts:
+                        countdown = _calculate_backoff_with_jitter(delivery.attempts)
+                        raise task.retry(exc=e, countdown=countdown)
+                    else:
+                        delivery.status = "failed"
+                        await session.commit()
+                        return {"status": "failed", "error": error_msg}
 
         except Exception as e:
+            # Catch-all for unexpected errors
+            error_msg = f"Unexpected error: {str(e)}"
+            delivery.last_error = error_msg
+            delivery.status = "failed"
+            await session.commit()
+
             logger.error(
-                "delivery_failed",
+                "delivery_unexpected_error",
                 delivery_id=delivery_id,
                 error=str(e),
                 attempt=delivery.attempts
             )
 
-            # Update delivery
-            delivery.status = "failed" if delivery.attempts >= settings.max_delivery_attempts else "pending"
-            delivery.last_error = str(e)
-            await session.commit()
+            return {"status": "failed", "error": error_msg}
 
-            # Retry
-            if delivery.attempts < settings.max_delivery_attempts:
-                countdown = settings.delivery_retry_backoff_base ** delivery.attempts
-                raise task.retry(exc=e, countdown=countdown)
 
-            return {"status": "failed", "error": str(e)}
+def _calculate_backoff_with_jitter(attempt: int) -> int:
+    """Calculate exponential backoff with jitter.
+    
+    Args:
+        attempt: Current attempt number (1-indexed)
+        
+    Returns:
+        Delay in seconds
+    """
+    # Base exponential backoff
+    base_delay = settings.delivery_retry_backoff_base ** attempt
+    max_delay = 60  # Cap at 60 seconds
+    
+    # Add jitter (±20%)
+    jitter_range = base_delay * 0.2
+    jitter = random.uniform(-jitter_range, jitter_range)
+    
+    delay = min(base_delay + jitter, max_delay)
+    
+    logger.debug(
+        "backoff_calculated",
+        attempt=attempt,
+        delay=delay,
+        base_delay=base_delay,
+        jitter=jitter
+    )
+    
+    return int(delay)
 
 

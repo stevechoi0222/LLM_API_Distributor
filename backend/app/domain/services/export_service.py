@@ -1,4 +1,4 @@
-"""Export service for results and deliveries (TICKET 5)."""
+"""Export service for results and deliveries (TICKET 5, TKT-013)."""
 import json
 import os
 from typing import Any, Dict, List
@@ -8,6 +8,7 @@ from app.core.logging import get_logger
 from app.db.models import Export, Run, RunItem, Response, Delivery
 from app.exporters.csv_exporter import CSVExporter
 from app.exporters.xlsx_exporter import XLSXExporter
+from app.exporters.xlsx_multi_sheet_exporter import XLSXMultiSheetExporter
 from app.exporters.jsonl_exporter import JSONLExporter
 
 logger = get_logger(__name__)
@@ -26,6 +27,7 @@ class ExportService:
         self.exporters = {
             "csv": CSVExporter(),
             "xlsx": XLSXExporter(),
+            "xlsx_multi": XLSXMultiSheetExporter(),  # TKT-013
             "jsonl": JSONLExporter(),
         }
 
@@ -120,6 +122,7 @@ class ExportService:
                 "persona_role": run_item.question.persona.role,
                 "persona_locale": run_item.question.persona.locale,
                 "topic_title": run_item.question.topic.title,
+                "campaign_name": run_item.question.topic.campaign.name if run_item.question.topic.campaign else "Unknown",  # TKT-013
                 "status": run_item.status,
                 "attempt_count": run_item.attempt_count,
                 "last_error": run_item.last_error,
@@ -147,7 +150,7 @@ class ExportService:
         export_id: str,
         output_dir: str = "artefacts",
     ) -> str:
-        """Execute export to file.
+        """Execute export to file (TKT-013: supports user_excel_v0_1 mapper).
         
         Args:
             export_id: Export ID
@@ -172,7 +175,13 @@ class ExportService:
             # Get results
             results = await self.get_run_results_for_export(export.run_id)
 
-            # Get exporter
+            # Check if using user_excel_v0_1 mapper (TKT-013)
+            if export.mapper_name == "user_excel_v0_1":
+                return await self._export_with_user_excel_mapper(
+                    export, results, output_dir
+                )
+            
+            # Standard export flow
             exporter = self.exporters.get(export.format)
             if not exporter:
                 raise ValueError(f"Unknown export format: {export.format}")
@@ -192,7 +201,7 @@ class ExportService:
 
             logger.info(
                 "export_completed",
-                export_id=export_id,
+                export_id=export.id,
                 file_path=file_path,
                 result_count=len(results)
             )
@@ -202,14 +211,72 @@ class ExportService:
         except Exception as e:
             export.status = "failed"
             await self.session.commit()
-            logger.error("export_failed", export_id=export_id, error=str(e))
+            logger.error("export_failed", export_id=export.id, error=str(e))
             raise
+
+    async def _export_with_user_excel_mapper(
+        self,
+        export: Export,
+        results: List[Dict[str, Any]],
+        output_dir: str,
+    ) -> str:
+        """Export with user_excel_v0_1 mapper (TKT-013).
+        
+        Args:
+            export: Export object
+            results: Normalized results
+            output_dir: Output directory
+            
+        Returns:
+            File path
+        """
+        from app.exporters.mappers.user_excel_v0_1 import get_mapper
+        
+        # Get mapper
+        mapper = get_mapper(export.mapper_name, export.mapper_version)
+        
+        # Map batch of results to multi-sheet structure
+        mapper_data = mapper.map_batch(results)
+        
+        # Use multi-sheet exporter
+        exporter = self.exporters.get("xlsx_multi")
+        if not exporter:
+            raise ValueError("Multi-sheet XLSX exporter not available")
+        
+        # Generate filename with mapper name
+        os.makedirs(output_dir, exist_ok=True)
+        filename = f"user_excel_v0_1_{export.run_id}.xlsx"
+        output_path = os.path.join(output_dir, filename)
+        
+        # Export with mapper data
+        file_path = await exporter.export(
+            data=[],  # Not used when mapper_data provided
+            output_path=output_path,
+            mapper_data=mapper_data
+        )
+        
+        # Update export
+        export.file_url = file_path
+        export.status = "completed"
+        await self.session.commit()
+        
+        logger.info(
+            "user_excel_export_completed",
+            export_id=export.id,
+            file_path=file_path,
+            result_count=len(results),
+            query_rows=len(mapper_data.get("query_rows", [])),
+            citation_rows=len(mapper_data.get("citation_rows", []))
+        )
+        
+        return file_path
 
     async def create_delivery(
         self,
         export_id: str,
         run_id: str,
         mapper_name: str,
+        mapper_version: str,
         payload: Dict[str, Any],
     ) -> Delivery:
         """Create delivery for partner API (TICKET 5).
@@ -218,6 +285,7 @@ class ExportService:
             export_id: Export ID
             run_id: Run ID
             mapper_name: Mapper name
+            mapper_version: Mapper version
             payload: Mapped payload
             
         Returns:
@@ -227,6 +295,7 @@ class ExportService:
             export_id=export_id,
             run_id=run_id,
             mapper_name=mapper_name,
+            mapper_version=mapper_version,
             payload_json=json.dumps(payload),
             status="pending",
         )
@@ -237,7 +306,8 @@ class ExportService:
             "delivery_created",
             delivery_id=delivery.id,
             export_id=export_id,
-            mapper=mapper_name
+            mapper=mapper_name,
+            mapper_version=mapper_version
         )
 
         return delivery

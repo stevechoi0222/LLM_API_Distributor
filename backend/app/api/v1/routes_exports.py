@@ -86,6 +86,7 @@ async def create_export(
             raise HTTPException(status_code=400, detail=str(e))
 
         # Create delivery for each result
+        deliveries_created = 0
         for result in results:
             if result.get("status") == "succeeded":
                 # Map payload
@@ -96,11 +97,19 @@ async def create_export(
                     export_id=export.id,
                     run_id=data.run_id,
                     mapper_name=data.mapper_name,
+                    mapper_version=data.mapper_version,
                     payload=payload,
                 )
 
                 # Enqueue delivery
                 deliver_to_partner.delay(delivery.id)
+                deliveries_created += 1
+
+        logger.info(
+            "export_deliveries_enqueued",
+            export_id=export.id,
+            deliveries_created=deliveries_created
+        )
 
     return ExportResponse(
         id=export.id,
@@ -111,6 +120,7 @@ async def create_export(
         status=export.status,
         file_url=export.file_url,
         created_at=export.created_at,
+        deliveries_created=deliveries_created if data.mapper_name else None,
     )
 
 
@@ -119,7 +129,7 @@ async def get_export_status(
     export_id: str,
     session: AsyncSession = Depends(get_authenticated_session),
 ):
-    """Get export status with delivery stats (TICKET 5)."""
+    """Get export status with delivery stats and sample failures (TICKET 5)."""
     # Get export
     stmt = select(Export).where(Export.id == export_id)
     result = await session.execute(stmt)
@@ -140,6 +150,28 @@ async def get_export_status(
     result = await session.execute(stmt)
     delivery_stats = {row.status: row.count for row in result}
 
+    # Get sample failures (up to 5)
+    sample_failures = []
+    if delivery_stats.get("failed", 0) > 0:
+        stmt = (
+            select(Delivery)
+            .where(Delivery.export_id == export_id, Delivery.status == "failed")
+            .order_by(Delivery.updated_at.desc())
+            .limit(5)
+        )
+        result = await session.execute(stmt)
+        failed_deliveries = result.scalars().all()
+        
+        sample_failures = [
+            {
+                "id": d.id,
+                "last_error": d.last_error,
+                "attempts": d.attempts,
+                "updated_at": d.updated_at.isoformat() if d.updated_at else None
+            }
+            for d in failed_deliveries
+        ]
+
     return ExportResponse(
         id=export.id,
         run_id=export.run_id,
@@ -150,6 +182,7 @@ async def get_export_status(
         file_url=export.file_url,
         created_at=export.created_at,
         delivery_stats=delivery_stats,
+        sample_failures=sample_failures if sample_failures else None,
     )
 
 
@@ -171,9 +204,11 @@ async def get_delivery_status(
         export_id=delivery.export_id,
         run_id=delivery.run_id,
         mapper_name=delivery.mapper_name,
+        mapper_version=delivery.mapper_version,
         status=delivery.status,
         attempts=delivery.attempts,
         last_error=delivery.last_error,
+        response_body=delivery.response_body,
         created_at=delivery.created_at,
         updated_at=delivery.updated_at,
     )
